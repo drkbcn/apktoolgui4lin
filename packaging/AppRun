@@ -1,0 +1,5 @@
+#!/bin/sh
+HERE="$(dirname "$(readlink -f "$0")")"
+export APKTOOLGUI_HOME="$HERE/usr/share/apktoolgui4lin"
+export PATH="$APKTOOLGUI_HOME/tools/jre/bin:$APKTOOLGUI_HOME/tools/android-build-tools:$PATH"
+exec /usr/bin/python3 "$APKTOOLGUI_HOME/apktoolgui4lin_gtk.py" "$@"

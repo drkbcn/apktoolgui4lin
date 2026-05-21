@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=APKTool GUI 4 Linux
+Comment=Decompile, rebuild, align and sign APK files
+Exec=apktoolgui4lin
+Icon=com.github.apktoolgui4lin
+Categories=Development;
+Terminal=false
