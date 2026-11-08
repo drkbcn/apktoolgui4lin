@@ -8,7 +8,7 @@ SHARE="$APPDIR/usr/share/apktoolgui4lin"
 rm -rf "$APPDIR"
 mkdir -p "$SHARE" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/scalable/apps"
 
-cp "$ROOT/apktoolgui4lin_gtk.py" "$SHARE/"
+cp "$ROOT/apktoolgui4lin_gtk.py" "$ROOT/apkpure.py" "$SHARE/"
 cp "$ROOT/README.md" "$SHARE/"
 cp -R "$ROOT/assets" "$SHARE/assets"
 cp -R "$ROOT/tools" "$SHARE/tools"

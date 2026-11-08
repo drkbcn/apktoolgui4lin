@@ -31,7 +31,7 @@ The goal is to provide a comfortable Linux desktop frontend around those tools, 
 - Verify APK signatures.
 - Visual APK information panel with package name, label, version, SDK data, ABIs, densities, and permissions.
 - Raw APK inspection using `aapt`/`aapt2` dumps.
-- APKCombo search integration with parsed results, package/name matching, and best-effort downloads.
+- APKPure search integration with package/name matching, full version list, and direct downloads (best effort).
 - Framework management:
   - install framework
   - list frameworks
@@ -78,20 +78,18 @@ Select an APK to inspect it without decoding. The visual summary shows the most 
 
 ### APK Search
 
-Search APKCombo by app name or package name from inside the app. Results are parsed into visual cards with:
+Search APKPure by app name or package name from inside the app. Results are shown as cards with:
 
-- app name
-- package name
-- developer
-- category
-- downloads/rating/size summary when available
-- latest version and older versions detected from the app page
+- app name, package name, developer and category
+- size and package type (`APK` or `XAPK`)
+- latest version, plus a `Load all versions` button to pick an older release
 - match score and match reason
-- source page link
-- download page link
-- best-effort direct download action
+- `Open in APKPure` link
+- direct download with a progress bar
 
-The direct download action first resolves APKCombo's variant page, selects the first available package variant, then downloads the resolved `/d?u=...` link with `curl`. A progress bar is shown while the download runs. If APKCombo changes its markup or blocks automated downloads, use `Open download page` and complete the download in the browser.
+The integration talks to APKPure's unofficial mobile API (`api.pureapk.com`) with plain Python (`apkpure.py`, standard library only), because the APKPure website sits behind a Cloudflare challenge that blocks automated clients. Many apps are served as `XAPK` bundles (a zip of split APKs); unzip them and use the base `.apk` with Apktool. If APKPure changes the API, use `Open in APKPure` and download from the browser.
+
+> APKCombo, used by earlier versions, shut down and is no longer supported.
 
 ### Build
 
@@ -234,10 +232,23 @@ Current generated AppImage:
 sha256sum dist/APKTool_GUI_4_Linux-x86_64.AppImage
 ```
 
+## Running On macOS (experimental)
+
+The GUI is plain GTK 4 + PyGObject, so it can run on macOS through Homebrew. It is not packaged as an `.app`; run it from source:
+
+```bash
+brew install gtk4 pygobject3 adwaita-icon-theme
+./scripts/download_tools.sh        # fetches macOS JRE, Apktool and Build Tools into tools/
+python3 apktoolgui4lin_gtk.py
+```
+
+`download_tools.sh` detects macOS and Apple Silicon/Intel automatically. On Apple Silicon the Android Build Tools (`aapt`, `aapt2`, `zipalign`) are x86_64 binaries and need Rosetta 2. The AppImage packaging is Linux-only.
+
 ## Project Structure
 
 ```text
 apktoolgui4lin_gtk.py        Main GTK application
+apkpure.py                   APKPure client (stdlib only, no GTK)
 tools/                       Bundled runtime tools
 scripts/download_tools.sh    Download helper for portable tools
 packaging/                   AppImage/AppDir files
@@ -260,7 +271,7 @@ Some APKs contain resources that `aapt2` rejects, such as PNG files with invalid
 - Bundle the Python/GTK runtime for a fully self-contained AppImage.
 - Add APK/APKS/XAPK split handling.
 - Add ADB install/pull helpers.
-- Improve APK Info and APKCombo Search with icons and manifest component summaries.
+- Improve APK Info and APKPure Search with icons and manifest component summaries.
 - Add presets for common decode/build/sign workflows.
 - Add project history and recent APKs.
 

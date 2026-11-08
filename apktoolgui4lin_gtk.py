@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-import html
 import json
 import os
 import re
 import shutil
 import subprocess
 import threading
-import tempfile
 import webbrowser
 from pathlib import Path
-from urllib.parse import quote, urljoin
 
+import apkpure
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -19,15 +17,13 @@ from gi.repository import Gdk, Gio, GLib, Gtk
 
 APP_ID = "com.github.apktoolgui4lin"
 APP_NAME = "APKTool GUI 4 Linux"
-APKCOMBO_BASE_URL = "https://apkcombo.com"
-APKCOMBO_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
 APP_ROOT = Path(os.environ.get("APKTOOLGUI_HOME", Path(__file__).resolve().parent))
 TOOLS_DIR = APP_ROOT / "tools"
 ASSETS_DIR = APP_ROOT / "assets"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "apktoolgui4lin"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 EXEC_CACHE_DIR = CONFIG_DIR / "exec-tools"
-APKCOMBO_ICON_CACHE_DIR = CONFIG_DIR / "apkcombo-icons"
+APKPURE_ICON_CACHE_DIR = CONFIG_DIR / "apkpure-icons"
 
 
 def bundled_path(*parts):
@@ -194,6 +190,7 @@ class ApkToolGui(Gtk.Application):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
         self.settings = load_settings()
         self.process = None
+        self.apkpure_downloading = False
         self.log_buffer = None
         self.widgets = {}
 
@@ -453,20 +450,20 @@ class ApkToolGui(Gtk.Application):
 
     def apk_search_page(self):
         box = self.page_box()
-        query = self.entry("apkcombo_query", "Telegram or org.telegram.messenger")
-        download_dir = self.entry("apkcombo_download_dir", default_download_directory())
+        query = self.entry("apkpure_query", "Telegram or org.telegram.messenger")
+        download_dir = self.entry("apkpure_download_dir", default_download_directory())
         query_row = Gtk.Box(spacing=8)
         query.set_hexpand(True)
-        query.connect("activate", self.on_apkcombo_search)
+        query.connect("activate", self.on_apkpure_search)
         query_row.append(query)
         search = Gtk.Button(label="Search")
         search.add_css_class("suggested-action")
-        search.connect("clicked", self.on_apkcombo_search)
+        search.connect("clicked", self.on_apkpure_search)
         query_row.append(search)
-        box.append(self.row("Search APKCombo", query_row))
+        box.append(self.row("Search APKPure", query_row))
         box.append(self.row("Download folder", download_dir, lambda _b: self.choose_folder(download_dir, "Select download folder")))
 
-        mode = self.combo("apkcombo_mode", [
+        mode = self.combo("apkpure_mode", [
             ("auto", "Auto"),
             ("name", "App name"),
             ("package", "Package name"),
@@ -475,26 +472,26 @@ class ApkToolGui(Gtk.Application):
 
         actions = Gtk.Box(spacing=8)
         open_search = Gtk.Button(label="Open search in browser")
-        open_search.connect("clicked", self.on_apkcombo_open_search)
+        open_search.connect("clicked", self.on_apkpure_open_search)
         actions.append(open_search)
         box.append(actions)
 
         notice = Gtk.Label(
-            label="APKCombo integration parses public result pages on a best-effort basis. Download only APKs you are legally allowed to obtain.",
+            label="APKPure integration uses its unofficial mobile API on a best-effort basis. Download only APKs you are legally allowed to obtain.",
             xalign=0,
         )
         notice.set_wrap(True)
         box.append(notice)
 
-        self.apkcombo_progress = Gtk.ProgressBar()
-        self.apkcombo_progress.set_show_text(True)
-        self.apkcombo_progress.set_text("Idle")
-        box.append(self.apkcombo_progress)
+        self.apkpure_progress = Gtk.ProgressBar()
+        self.apkpure_progress.set_show_text(True)
+        self.apkpure_progress.set_text("Idle")
+        box.append(self.apkpure_progress)
 
-        self.apkcombo_results_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.apkpure_results_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         scroller = Gtk.ScrolledWindow()
         scroller.set_vexpand(True)
-        scroller.set_child(self.apkcombo_results_box)
+        scroller.set_child(self.apkpure_results_box)
         box.append(scroller)
         return box
 
@@ -1224,16 +1221,7 @@ class ApkToolGui(Gtk.Application):
             child = next_child
         return False
 
-    def strip_html(self, value):
-        value = re.sub(r"<[^>]+>", " ", value)
-        value = re.sub(r"\s+", " ", value)
-        return html.unescape(value).strip()
-
-    def apkcombo_search_url(self):
-        query = self.field("apkcombo_query")
-        return f"{APKCOMBO_BASE_URL}/search/{quote(query)}"
-
-    def apkcombo_score(self, query, mode, name, package, developer, category):
+    def apkpure_score(self, query, mode, name, package, developer, category):
         query_norm = query.strip().lower()
         name_norm = name.lower()
         package_norm = package.lower()
@@ -1258,105 +1246,17 @@ class ApkToolGui(Gtk.Application):
                 return int(45 + 35 * (matched / len(tokens))), f"{matched}/{len(tokens)} query tokens"
         return 10, "weak related result"
 
-    def parse_apkcombo_results(self, query, mode, html_text):
-        pattern = re.compile(
-            r'<a\s+class="l_item"\s+href="(?P<href>[^"]+)"\s+title="(?P<title>[^"]*)".*?'
-            r'<span\s+class="name">(?P<name>.*?)</span>.*?'
-            r'<span\s+class="author">(?P<author>.*?)</span>.*?'
-            r'<span\s+class="description">(?P<description>.*?)</span>',
-            re.S,
-        )
-        results = []
-        seen = set()
-        for match in pattern.finditer(html_text):
-            href = html.unescape(match.group("href"))
-            url = urljoin(APKCOMBO_BASE_URL, href)
-            if url in seen:
-                continue
-            seen.add(url)
-            path_parts = [part for part in href.split("/") if part]
-            package = path_parts[-1] if path_parts else ""
-            author = self.strip_html(match.group("author"))
-            if " · " in author:
-                developer, category = author.split(" · ", 1)
-            else:
-                developer, category = author, ""
-            description = self.strip_html(match.group("description"))
-            metrics = re.findall(r"<span[^>]*>(.*?)</span>", match.group("description"), re.S)
-            metrics = [self.strip_html(item) for item in metrics]
-            icon_match = re.search(r'<img[^>]+src="(?P<src>[^"]+)"', match.group(0), re.S)
-            icon_url = urljoin(APKCOMBO_BASE_URL, html.unescape(icon_match.group("src"))) if icon_match else ""
-            score, reason = self.apkcombo_score(query, mode, self.strip_html(match.group("name")), package, developer, category)
-            download_url = urljoin(APKCOMBO_BASE_URL, href.rstrip("/") + "/download/apk")
-            results.append({
-                "name": self.strip_html(match.group("name")),
-                "package": package,
-                "developer": developer,
-                "category": category,
-                "description": description,
-                "metrics": " | ".join(metrics) if metrics else description,
-                "latest_version": "Unknown",
-                "versions": [],
-                "url": url,
-                "download_url": download_url,
-                "icon_url": icon_url,
-                "score": score,
-                "reason": reason,
-            })
-        results.sort(key=lambda item: item["score"], reverse=True)
-        return results
+    @staticmethod
+    def format_size(size):
+        if not size:
+            return ""
+        value = float(size)
+        for unit in ("B", "KB", "MB", "GB"):
+            if value < 1024 or unit == "GB":
+                return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+            value /= 1024
 
-    def parse_apkcombo_versions(self, html_text):
-        versions = []
-        current = re.search(r'<div\s+class="version">(?P<value>.*?)</div>', html_text, re.S)
-        if current:
-            value = self.strip_html(current.group("value"))
-            if value:
-                versions.append({"name": value, "href": ""})
-        for match in re.finditer(r'<a\s+class="ver-item"[^>]*href="(?P<href>[^"]+)"[^>]*>.*?<span\s+class="vername">(?P<value>.*?)</span>', html_text, re.S):
-            value = self.strip_html(match.group("value"))
-            value = re.sub(r"^.*?\s+(\d+(?:[._-]\d+)*.*)$", r"\1", value)
-            if value:
-                versions.append({"name": value, "href": html.unescape(match.group("href"))})
-        if not versions:
-            meta = re.search(r"Latest Version:\s*([^-\"]+)", html.unescape(html_text))
-            if meta:
-                versions.append({"name": meta.group(1).strip(), "href": ""})
-        clean = []
-        seen = set()
-        for version in versions:
-            name = version.get("name", "").strip()
-            href = version.get("href", "").strip()
-            if not name or name in seen:
-                continue
-            seen.add(name)
-            clean.append({
-                "name": name,
-                "url": urljoin(APKCOMBO_BASE_URL, href) if href else "",
-                "download_url": urljoin(APKCOMBO_BASE_URL, href.rstrip("/") + "/download/apk") if href else "",
-            })
-        return clean
-
-    def enrich_apkcombo_results(self, curl, results, limit=12):
-        for item in results[:limit]:
-            try:
-                detail = subprocess.run(
-                    [curl, "-L", "-s", "-A", APKCOMBO_USER_AGENT, item["url"]],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    check=False,
-                    timeout=20,
-                )
-                if detail.returncode == 0:
-                    versions = self.parse_apkcombo_versions(detail.stdout)
-                    item["versions"] = versions[:8]
-                    item["latest_version"] = versions[0]["name"] if versions else "Unknown"
-            except Exception:
-                pass
-        return results
-
-    def update_apkcombo_icon(self, picture, icon_path):
+    def update_apkpure_icon(self, picture, icon_path):
         try:
             texture = Gdk.Texture.new_from_filename(str(icon_path))
             picture.set_paintable(texture)
@@ -1364,54 +1264,62 @@ class ApkToolGui(Gtk.Application):
             pass
         return False
 
-    def load_apkcombo_icon(self, picture, result):
+    def load_apkpure_icon(self, picture, result):
         icon_url = result.get("icon_url")
         if not icon_url:
             return
-        curl = shutil.which("curl")
-        if not curl:
-            return
 
         def worker():
-            APKCOMBO_ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            package = re.sub(r"[^A-Za-z0-9._-]+", "_", result.get("package") or result.get("name") or "apkcombo")
-            suffix = Path(icon_url.split("?", 1)[0]).suffix or ".png"
-            cached = APKCOMBO_ICON_CACHE_DIR / f"{package}{suffix}"
-            if not cached.exists():
-                temp = None
-                try:
-                    handle = tempfile.NamedTemporaryFile(delete=False, dir=APKCOMBO_ICON_CACHE_DIR, suffix=suffix)
-                    handle.close()
-                    temp = Path(handle.name)
-                    command = [curl, "-L", "--fail", "-s", "-A", APKCOMBO_USER_AGENT, "-o", str(temp), icon_url]
-                    result_proc = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False, timeout=30)
-                    if result_proc.returncode != 0 or temp.stat().st_size == 0:
-                        if temp.exists():
-                            temp.unlink()
-                        return
-                    temp.replace(cached)
-                except Exception:
-                    if temp and temp.exists():
-                        temp.unlink()
-                    return
-            GLib.idle_add(self.update_apkcombo_icon, picture, cached)
+            package = re.sub(r"[^A-Za-z0-9._-]+", "_", result.get("package") or result.get("name") or "apkpure")
+            cached = APKPURE_ICON_CACHE_DIR / f"{package}.png"
+            try:
+                if not cached.exists():
+                    APKPURE_ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    apkpure.download(icon_url, str(cached))
+            except (apkpure.ApkPureError, OSError):
+                return
+            GLib.idle_add(self.update_apkpure_icon, picture, cached)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def selected_apkcombo_version(self, result, combo):
+    def selected_apkpure_version(self, result, combo):
         active = combo.get_active_id() or ""
         for version in result.get("versions", []):
-            if version.get("name") == active:
+            if version.get("label") == active:
                 return version
-        if result.get("versions"):
-            return result["versions"][0]
-        return {
-            "name": result.get("latest_version") or "Latest",
-            "url": result.get("url", ""),
-            "download_url": result.get("download_url", ""),
-        }
+        return result["versions"][0] if result.get("versions") else result
 
-    def add_apkcombo_result(self, result):
+    def fill_version_combo(self, result, combo, button):
+        combo.remove_all()
+        for version in result["versions"]:
+            combo.append(version["label"], f"{version['label']}  ({version['kind'].upper()}, {self.format_size(version['size'])})")
+        combo.set_active(0)
+        button.set_label(f"{len(result['versions'])} versions loaded")
+        return False
+
+    def on_apkpure_load_versions(self, result, combo, button):
+        button.set_sensitive(False)
+        button.set_label("Loading...")
+
+        def worker():
+            try:
+                versions = apkpure.versions(result["package"])
+            except apkpure.ApkPureError as exc:
+                GLib.idle_add(self.append_log, f"Could not load versions for {result['package']}: {exc}")
+                GLib.idle_add(button.set_label, "Load all versions")
+                GLib.idle_add(button.set_sensitive, True)
+                return
+            if versions:
+                result["versions"] = versions
+                GLib.idle_add(self.fill_version_combo, result, combo, button)
+            else:
+                GLib.idle_add(button.set_label, "No other versions")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def add_apkpure_result(self, result):
+        # The search hit is itself the latest version; "Load all versions" replaces this list.
+        result["versions"] = [{**result, "label": result["version"]}]
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         card.add_css_class("card")
         header = Gtk.Box(spacing=10)
@@ -1419,225 +1327,125 @@ class ApkToolGui(Gtk.Application):
         icon.set_size_request(48, 48)
         icon.set_can_shrink(True)
         header.append(icon)
-        title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         title = Gtk.Label(label=f"{result['name']}  -  {result['score']}% match", xalign=0)
         title.add_css_class("title-4")
         title.set_selectable(True)
-        title_box.append(title)
-        header.append(title_box)
+        header.append(title)
         card.append(header)
-        self.load_apkcombo_icon(icon, result)
-        meta = Gtk.Label(
-            label=f"{result['package']} | {result['developer']} | {result['category']} | {result['metrics']}",
-            xalign=0,
-        )
+        self.load_apkpure_icon(icon, result)
+        details = [result["package"], result["developer"], result["category"], self.format_size(result["size"]), result["kind"].upper()]
+        meta = Gtk.Label(label=" | ".join(part for part in details if part), xalign=0)
         meta.set_wrap(True)
         meta.set_selectable(True)
         card.append(meta)
-        version_text = f"Latest: {result.get('latest_version') or 'Unknown'}"
-        if result.get("versions"):
-            version_text += " | Available: " + ", ".join(version["name"] for version in result["versions"][:6])
-        versions = Gtk.Label(label=version_text, xalign=0)
-        versions.set_wrap(True)
-        versions.set_selectable(True)
-        card.append(versions)
         version_row = Gtk.Box(spacing=8)
-        version_label = Gtk.Label(label="Download version", xalign=0)
-        version_row.append(version_label)
+        version_row.append(Gtk.Label(label="Download version", xalign=0))
         version_combo = Gtk.ComboBoxText()
-        if result.get("versions"):
-            for version in result["versions"]:
-                version_combo.append(version["name"], version["name"])
-            version_combo.set_active(0)
-        else:
-            fallback = result.get("latest_version") or "Latest"
-            version_combo.append(fallback, fallback)
-            version_combo.set_active(0)
+        version_combo.append(result["version"], f"{result['version']}  (latest)")
+        version_combo.set_active(0)
         version_row.append(version_combo)
+        load_versions = Gtk.Button(label="Load all versions")
+        load_versions.connect("clicked", lambda b, item=result, combo=version_combo: self.on_apkpure_load_versions(item, combo, b))
+        version_row.append(load_versions)
         card.append(version_row)
         reason = Gtk.Label(label=f"Match: {result['reason']}", xalign=0)
         reason.add_css_class("caption")
         card.append(reason)
         actions = Gtk.Box(spacing=8)
-        open_button = Gtk.Button(label="Open page")
-        open_button.connect("clicked", lambda _b, url=result["url"]: webbrowser.open(url))
+        open_button = Gtk.Button(label="Open in APKPure")
+        open_button.connect("clicked", lambda _b, item=result: webbrowser.open(apkpure.web_search_url(item["package"])))
         actions.append(open_button)
-        download_page = Gtk.Button(label="Open download page")
-        download_page.connect("clicked", lambda _b, item=result, combo=version_combo: webbrowser.open(self.selected_apkcombo_version(item, combo).get("download_url") or item["download_url"]))
-        actions.append(download_page)
         download = Gtk.Button(label="Download")
-        download.connect("clicked", lambda _b, item=result, combo=version_combo: self.on_apkcombo_download(item, self.selected_apkcombo_version(item, combo)))
+        download.connect("clicked", lambda _b, item=result, combo=version_combo: self.on_apkpure_download(item, self.selected_apkpure_version(item, combo)))
         actions.append(download)
         card.append(actions)
-        self.apkcombo_results_box.append(card)
+        self.apkpure_results_box.append(card)
         return False
 
-    def set_apkcombo_progress(self, fraction=None, text=None, pulse=False):
+    def set_apkpure_progress(self, fraction=None, text=None, pulse=False):
         if pulse:
-            self.apkcombo_progress.pulse()
+            self.apkpure_progress.pulse()
         elif fraction is not None:
-            self.apkcombo_progress.set_fraction(max(0.0, min(1.0, fraction)))
+            self.apkpure_progress.set_fraction(max(0.0, min(1.0, fraction)))
         if text is not None:
-            self.apkcombo_progress.set_text(text)
+            self.apkpure_progress.set_text(text)
         return False
 
-    def on_apkcombo_open_search(self, _button):
-        webbrowser.open(self.apkcombo_search_url())
+    def on_apkpure_open_search(self, _button):
+        webbrowser.open(apkpure.web_search_url(self.field("apkpure_query")))
 
-    def on_apkcombo_search(self, _button):
-        query = self.field("apkcombo_query")
+    def on_apkpure_search(self, _button):
+        query = self.field("apkpure_query")
         if not query:
-            self.append_log("Missing required field: APKCombo query")
+            self.append_log("Missing required field: APKPure query")
             return
-        curl = shutil.which("curl")
-        if not curl:
-            self.append_log("curl is required for APKCombo search because urllib is commonly blocked by APKCombo.")
-            return
-        mode = self.combo_value("apkcombo_mode")
-        url = self.apkcombo_search_url()
+        mode = self.combo_value("apkpure_mode")
 
         def worker():
-            GLib.idle_add(self.set_status, "Searching APKCombo")
-            GLib.idle_add(self.clear_box, self.apkcombo_results_box)
-            command = [curl, "-L", "-s", "-A", APKCOMBO_USER_AGENT, url]
+            GLib.idle_add(self.set_status, "Searching APKPure")
+            GLib.idle_add(self.clear_box, self.apkpure_results_box)
             try:
-                result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False, timeout=45)
-                if result.returncode != 0:
-                    GLib.idle_add(self.append_log, result.stdout.strip() or f"APKCombo search failed with exit {result.returncode}")
-                    GLib.idle_add(self.set_status, "Error")
-                    return
-                results = self.parse_apkcombo_results(query, mode, result.stdout)
-                if not results:
-                    GLib.idle_add(self.append_log, "No APKCombo results were parsed. The page structure may have changed or access may be blocked.")
-                else:
-                    GLib.idle_add(self.append_log, "Fetching APKCombo version metadata for top results...")
-                    results = self.enrich_apkcombo_results(curl, results)
-                for item in results[:30]:
-                    GLib.idle_add(self.add_apkcombo_result, item)
-                GLib.idle_add(self.append_log, f"APKCombo results parsed: {len(results)} from {url}")
-                GLib.idle_add(self.set_status, "Completed")
-            except Exception as exc:
-                GLib.idle_add(self.append_log, f"APKCombo search failed: {exc}")
+                results = apkpure.search(query)
+            except apkpure.ApkPureError as exc:
+                GLib.idle_add(self.append_log, f"APKPure search failed: {exc}")
                 GLib.idle_add(self.set_status, "Error")
+                return
+            for item in results:
+                item["score"], item["reason"] = self.apkpure_score(query, mode, item["name"], item["package"], item["developer"], item["category"])
+            results.sort(key=lambda item: item["score"], reverse=True)
+            if not results:
+                GLib.idle_add(self.append_log, "APKPure returned no results.")
+            for item in results[:30]:
+                GLib.idle_add(self.add_apkpure_result, item)
+            GLib.idle_add(self.append_log, f"APKPure results: {len(results)} for '{query}'")
+            GLib.idle_add(self.set_status, "Completed")
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def on_apkcombo_download(self, result, version=None):
-        curl = shutil.which("curl")
-        if not curl:
-            self.append_log("curl is required for APKCombo downloads.")
+    def on_apkpure_download(self, result, version):
+        if self.apkpure_downloading:
+            self.append_log("An APKPure download is already running.")
             return
-        directory = Path(self.field("apkcombo_download_dir") or default_download_directory())
-        directory.mkdir(parents=True, exist_ok=True)
-        threading.Thread(target=self.download_apkcombo_item, args=(curl, result, version, directory), daemon=True).start()
-
-    def parse_apkcombo_variants(self, html_text):
-        variants = []
-        seen = set()
-        pattern = re.compile(r'<a\s+href="(?P<href>[^"]+)"\s+class="variant"(?P<body>.*?)</a>', re.S)
-        for match in pattern.finditer(html_text):
-            href = html.unescape(match.group("href"))
-            if href in seen:
-                continue
-            seen.add(href)
-            body = match.group("body")
-            name = self.strip_html(re.search(r'<span\s+class="vername">(?P<value>.*?)</span>', body, re.S).group("value")) if re.search(r'<span\s+class="vername">(?P<value>.*?)</span>', body, re.S) else "APKCombo package"
-            size = self.strip_html(re.search(r'<span\s+class="spec ltr">(?P<value>.*?)</span>', body, re.S).group("value")) if re.search(r'<span\s+class="spec ltr">(?P<value>.*?)</span>', body, re.S) else ""
-            kind_match = re.search(r'<span\s+class="type-[^"]+">(?P<value>.*?)</span>', body, re.S)
-            kind = self.strip_html(kind_match.group("value")).lower() if kind_match else "apk"
-            arch_match = re.search(r'<code>(?P<value>[^<]+)</code>', html_text[:match.start()])
-            arch = self.strip_html(arch_match.group("value")) if arch_match else ""
-            variants.append({
-                "url": href,
-                "name": name,
-                "size": size,
-                "kind": kind if kind in ("apk", "xapk", "apks", "zip") else "apk",
-                "arch": arch,
-            })
-        return variants
-
-    def safe_download_name(self, result, variant, version_name=""):
-        base = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{result['package']}-{version_name or variant['name']}".strip("-"))
-        base = base.strip("._-") or result["package"] or "apkcombo-download"
-        ext = variant.get("kind") or "apk"
-        if not base.lower().endswith(f".{ext}"):
-            base = f"{base}.{ext}"
-        return base
-
-    def download_apkcombo_item(self, curl, result, version, directory):
-        if self.process:
-            GLib.idle_add(self.append_log, "A task is already running.")
-            return
-        version = version or {
-            "name": result.get("latest_version") or "Latest",
-            "download_url": result.get("download_url", ""),
-        }
-        GLib.idle_add(self.set_status, f"Resolving {result['name']}")
-        GLib.idle_add(self.set_apkcombo_progress, 0.0, "Resolving download page")
-        page_cmd = [curl, "-L", "-s", "-A", APKCOMBO_USER_AGENT, version.get("download_url") or result["download_url"]]
+        directory = Path(expand(self.field("apkpure_download_dir") or default_download_directory()))
         try:
-            page = subprocess.run(page_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False, timeout=45)
-            if page.returncode != 0:
-                GLib.idle_add(self.append_log, page.stdout.strip() or f"Could not load APKCombo download page: exit {page.returncode}")
-                GLib.idle_add(self.set_status, "Error")
-                return
-            variants = self.parse_apkcombo_variants(page.stdout)
-            if not variants:
-                GLib.idle_add(self.append_log, "No APKCombo variant links were found. Open the download page in a browser.")
-                GLib.idle_add(self.set_status, "Error")
-                return
-            variant = variants[0]
-            if len(variants) > 1:
-                GLib.idle_add(self.append_log, f"Found {len(variants)} variants. Downloading first variant: {variant['name']} {variant['arch']} {variant['size']}".strip())
-            download_url = urljoin(APKCOMBO_BASE_URL, variant["url"])
-            output = directory / self.safe_download_name(result, variant, version.get("name", ""))
-            command = [curl, "-L", "--fail", "-A", APKCOMBO_USER_AGENT, "-o", str(output), download_url]
-            GLib.idle_add(self.append_log, "$ " + " ".join(command))
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.append_log(f"Cannot create download folder {directory}: {exc}")
+            return
+        self.apkpure_downloading = True
+        threading.Thread(target=self.download_apkpure_item, args=(result, version, directory), daemon=True).start()
+
+    def safe_download_name(self, result, version):
+        base = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{result['package']}-{version.get('version') or 'latest'}")
+        if version.get("version_code"):
+            base += f"-{version['version_code']}"
+        ext = version.get("kind") if version.get("kind") in ("apk", "xapk", "apks", "zip") else "apk"
+        return f"{base.strip('._-')}.{ext}"
+
+    def download_apkpure_item(self, result, version, directory):
+        output = directory / self.safe_download_name(result, version)
+        try:
+            GLib.idle_add(self.append_log, f"Downloading {result['name']} {version.get('version', '')} -> {output}")
             GLib.idle_add(self.set_status, f"Downloading {result['name']}")
-            GLib.idle_add(self.set_apkcombo_progress, 0.0, f"Downloading {output.name}")
-            self.process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            progress_buffer = ""
-            assert self.process.stdout is not None
-            while True:
-                char = self.process.stdout.read(1)
-                if char == "" and self.process.poll() is not None:
-                    break
-                if not char:
-                    continue
-                if char in ("\r", "\n"):
-                    text = progress_buffer.strip()
-                    progress_buffer = ""
-                    percent_match = re.search(r"(\d{1,3}(?:\.\d+)?)%", text) or re.search(r"^\s*(\d{1,3})\s+", text)
-                    if percent_match:
-                        percent = min(100.0, float(percent_match.group(1)))
-                        GLib.idle_add(self.set_apkcombo_progress, percent / 100.0, f"{percent:.0f}% - {output.name}")
-                    elif text:
-                        GLib.idle_add(self.append_log, text)
-                    else:
-                        GLib.idle_add(self.set_apkcombo_progress, None, None, True)
+            GLib.idle_add(self.set_apkpure_progress, 0.0, f"Downloading {output.name}")
+
+            def progress(done, total):
+                if total:
+                    GLib.idle_add(self.set_apkpure_progress, done / total, f"{done * 100 // total}% - {output.name}")
                 else:
-                    progress_buffer += char
-            code = self.process.wait()
-            if code == 0 and output.exists() and output.stat().st_size > 0:
-                GLib.idle_add(self.set_apkcombo_progress, 1.0, f"Downloaded {output.name}")
-                GLib.idle_add(self.append_log, f"Downloaded: {output} ({output.stat().st_size} bytes)")
-                GLib.idle_add(self.set_status, "Completed")
-            else:
-                if output.exists() and output.stat().st_size == 0:
-                    output.unlink()
-                GLib.idle_add(self.append_log, f"Download failed with exit {code}. Open the download page in a browser.")
-                GLib.idle_add(self.set_status, "Error")
-        except Exception as exc:
-            GLib.idle_add(self.append_log, f"APKCombo download failed: {exc}")
+                    GLib.idle_add(self.set_apkpure_progress, None, f"{self.format_size(done)} - {output.name}", True)
+
+            apkpure.download(version["download_url"], str(output), progress)
+            GLib.idle_add(self.set_apkpure_progress, 1.0, f"Downloaded {output.name}")
+            GLib.idle_add(self.append_log, f"Downloaded: {output} ({output.stat().st_size} bytes)")
+            if output.suffix.lower() in (".xapk", ".apks", ".zip"):
+                GLib.idle_add(self.append_log, "This is a bundle (split APKs). Unzip it and use the base .apk inside with Apktool.")
+            GLib.idle_add(self.set_status, "Completed")
+        except apkpure.ApkPureError as exc:
+            GLib.idle_add(self.append_log, f"{exc}. Use 'Open in APKPure' to download from the browser.")
             GLib.idle_add(self.set_status, "Error")
         finally:
-            self.process = None
+            self.apkpure_downloading = False
 
     def parse_badging(self, text):
         def single(pattern):
